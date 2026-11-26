@@ -1,0 +1,21 @@
+[
+    {
+        "AllowedOrigins": [
+            "https://uikei.github.io",
+            "http://localhost",
+            "http://127.0.0.1"
+        ],
+        "AllowedMethods": [
+            "PUT",
+            "GET",
+            "HEAD"
+        ],
+        "AllowedHeaders": [
+            "*"
+        ],
+        "ExposeHeaders": [
+            "ETag"
+        ],
+        "MaxAgeSeconds": 3600
+    }
+]

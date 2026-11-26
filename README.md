@@ -22,17 +22,26 @@ A cozy video diary where anyone can browse and upload videos without creating an
 
 The local database connection defaults to host `127.0.0.1`, database `journey_video_diary`, user `root`, and an empty password, as in a default XAMPP installation. For another setup, configure `JOURNEY_DB_HOST`, `JOURNEY_DB_NAME`, `JOURNEY_DB_USER`, and `JOURNEY_DB_PASSWORD` in the PHP/Apache environment.
 
-## Publishing on GitHub Pages
+If you already have this site’s database and video rows, do **not** import the fresh-install SQL over it. Run `data/migrations/2026-11-26-r2-video-storage.sql` against the existing database to add the R2 columns and upload-session table without removing existing rows. Keep existing files in `backend/uploads/`.
 
-GitHub Pages can serve this `index.html` frontend, but it does not execute PHP or host the MySQL database or uploaded videos. The frontend and PHP API must therefore be hosted separately for the gallery and uploads to work.
+## Large video storage with Cloudflare R2
 
-1. Deploy `backend/api.php`, `backend/database.php`, the MySQL database, and `backend/uploads/` on a PHP/MySQL host.
-2. Set `JOURNEY_ALLOWED_ORIGIN` on that host to `https://uikei.github.io` so the PHP API allows browser requests from the GitHub Pages site.
-3. Change the `journey-api-url` meta tag in `index.html` to the full API URL provided by that host, for example `https://your-host.example/backend/api.php`.
-4. Deploy the updated frontend to GitHub Pages. Test `https://your-host.example/backend/api.php?action=list` directly; it must return JSON with the `application/json` content type.
+R2 mode sends videos directly from the browser to a private Cloudflare R2 bucket in 64 MB multipart chunks. PHP handles upload authorization and video metadata; it does not receive the full video. The configured maximum is 20 GB per video. That is a file-size limit, not a guaranteed duration: actual vlog length depends on the video’s resolution, codec, and bitrate.
 
-Until a PHP API host is configured, the page displays a clear backend-unavailable message rather than trying to parse PHP source as JSON. Never configure a PHP endpoint to return its source code. The local XAMPP API path only works on the XAMPP site; keep the API URL and host CORS origin in sync when publishing.
+1. Create a private R2 bucket and an API token with read/write access limited to that bucket. Keep the token secret.
+2. Deploy the PHP API to a PHP 8.2+ host with MySQL and the PHP `pdo_mysql`, `fileinfo`, and `openssl` extensions. Install the PHP dependency from the project directory with `composer install --no-dev --optimize-autoloader`; deploy `vendor/` with the PHP backend.
+3. Configure the PHP host’s environment variables:
+   - `JOURNEY_STORAGE_DRIVER=r2`
+   - `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, and `R2_BUCKET_NAME`
+   - `JOURNEY_DB_HOST`, `JOURNEY_DB_NAME`, `JOURNEY_DB_USER`, and `JOURNEY_DB_PASSWORD`
+   - `JOURNEY_ALLOWED_ORIGIN=https://uikei.github.io` (or the exact origin of your custom frontend domain)
+4. On an existing database, run `data/migrations/2026-11-26-r2-video-storage.sql` once. For a brand-new database, import `data/database.sql` instead.
+5. Apply `data/r2-cors.json` in the R2 bucket’s CORS settings. Add the exact frontend origin if using a custom domain. The CORS rule must allow browser `PUT` uploads and expose `ETag`.
+6. In `index.html`, set the `journey-api-url` meta tag to the full PHP API URL, such as `https://your-host.example/backend/api.php`, and publish the frontend to GitHub Pages.
+7. Check `https://your-host.example/backend/api.php?action=list`. It must return JSON with an `application/json` content type and `"upload_mode":"r2"`. Then test a small upload and playback before uploading a long vlog.
 
-MP4 and WebM videos can be up to 150 MB. The browser creates a cover image from the video unless a JPEG, PNG, or WebP cover is selected. Covers are limited to 5 MB. To allow the maximum upload size, set `upload_max_filesize = 150M` and `post_max_size = 156M` in PHP's `php.ini`, then restart Apache. Hosting providers may enforce lower limits.
+Never put R2 credentials in `index.html`, JavaScript, or the GitHub repository. The public website can be hosted on GitHub Pages, but its PHP API, MySQL database, Composer dependencies, and R2 bucket must be configured on their respective providers before uploads work. Until then, the gallery shows a clear backend-unavailable message.
+
+In local storage mode, MP4 and WebM videos are limited to 150 MB and pass through PHP; set `upload_max_filesize = 150M` and `post_max_size = 156M` in PHP’s `php.ini`, then restart Apache. R2 mode avoids the PHP upload-size limit for videos. Covers are limited to 5 MB in either mode.
 
 Delete keys are kept in the uploading browser's local storage; no login or account is created. Clearing that browser's saved site data removes its ability to delete its uploads. Titles, descriptions, names, videos, and covers are public. Since uploads are open to everyone, use this on a trusted host and monitor storage and bandwidth.

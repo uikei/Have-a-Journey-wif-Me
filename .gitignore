@@ -1,0 +1,6 @@
+/vendor/
+/.env
+/backend/uploads/*
+!/backend/uploads/.htaccess
+/backend/data/*
+!/backend/data/.htaccess

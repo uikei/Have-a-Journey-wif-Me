@@ -14,7 +14,7 @@
         href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Nunito:wght@400;500;600;700;800;900&display=swap"
         rel="stylesheet">
     <link rel="stylesheet" href="frontend/styles.css?v=4">
-    <script src="frontend/app.js?v=4" defer></script>
+    <script src="frontend/app.js?v=5" defer></script>
 </head>
 
 <body>
@@ -103,7 +103,7 @@
                 <label class="file-drop" for="video-file" id="file-drop">
                     <span class="upload-icon" aria-hidden="true">↑</span>
                     <span class="file-prompt"><strong>Choose a video</strong> or drop it right here</span>
-                    <span class="file-help">MP4 or WebM · up to 150 MB</span>
+                    <span id="file-help" class="file-help">MP4 or WebM · up to 150 MB</span>
                     <span id="file-name" class="file-name"></span>
                     <input id="video-file" name="video" type="file" accept="video/mp4,video/webm,.mp4,.webm" required>
                 </label>

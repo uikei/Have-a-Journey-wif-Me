@@ -1,6 +1,9 @@
 const apiUrlMeta = document.querySelector('meta[name="journey-api-url"]');
 const API_URL = apiUrlMeta?.content.trim() || "backend/api.php";
-const MAX_FILE_SIZE = 150 * 1024 * 1024;
+const MAX_LOCAL_FILE_SIZE = 150 * 1024 * 1024;
+const MAX_R2_FILE_SIZE = 20 * 1024 * 1024 * 1024;
+const R2_PART_SIZE = 64 * 1024 * 1024;
+const R2_UPLOAD_CONCURRENCY = 2;
 const MAX_COVER_SIZE = 5 * 1024 * 1024;
 const DELETE_TOKEN_STORAGE_KEY = "have-a-journey-video-delete-keys";
 
@@ -10,6 +13,7 @@ const uploadForm = document.querySelector("#upload-form");
 const fileInput = document.querySelector("#video-file");
 const coverInput = document.querySelector("#cover-file");
 const fileName = document.querySelector("#file-name");
+const fileHelp = document.querySelector("#file-help");
 const coverName = document.querySelector("#cover-name");
 const fileDrop = document.querySelector("#file-drop");
 const uploadMessage = document.querySelector("#upload-message");
@@ -28,6 +32,7 @@ const confirmDeleteButton = document.querySelector("#confirm-delete");
 
 let videos = [];
 let pendingDelete = null;
+let uploadMode = "local";
 
 function showVideoMessage(message, className) {
     const element = document.createElement("p");
@@ -50,12 +55,52 @@ async function readApiResponse(response) {
     if (!contentType.toLowerCase().includes("application/json")) {
         throw new Error(backendUnavailableMessage());
     }
-
     try {
         return await response.json();
     } catch {
         throw new Error("The video server returned an invalid response. Please try again later.");
     }
+}
+
+async function postApiJson(action, payload) {
+    const response = await fetch(`${API_URL}?action=${action}`, {
+        method: "POST",
+        headers: {
+            Accept: "application/json",
+            "Content-Type": "application/json",
+        },
+        body: JSON.stringify(payload),
+    });
+    const result = await readApiResponse(response);
+    if (!response.ok || !result.success) {
+        throw new Error(result.error || "The video request could not be completed.");
+    }
+    return result;
+}
+
+function uploadBlobWithProgress(url, blob, mimeType, onProgress) {
+    return new Promise((resolve, reject) => {
+        const request = new XMLHttpRequest();
+        request.open("PUT", url);
+        request.setRequestHeader("Content-Type", mimeType);
+        request.upload.addEventListener("progress", (event) => {
+            if (event.lengthComputable) onProgress(event.loaded);
+        });
+        request.addEventListener("load", () => {
+            if (request.status < 200 || request.status >= 300) {
+                reject(new Error(`Storage rejected an upload part (HTTP ${request.status}).`));
+                return;
+            }
+            const etag = request.getResponseHeader("ETag");
+            if (!etag) {
+                reject(new Error("Storage did not return an ETag. Check the R2 bucket CORS ExposeHeaders setting."));
+                return;
+            }
+            resolve(etag);
+        });
+        request.addEventListener("error", () => reject(new Error("Could not reach video storage. Check the R2 bucket CORS settings and your connection.")));
+        request.send(blob);
+    });
 }
 
 function readDeleteTokens() {
@@ -263,6 +308,10 @@ async function loadVideos() {
         if (!response.ok || !result.success || !Array.isArray(result.videos)) {
             throw new Error(result.error || "Couldn't load the videos right now.");
         }
+        uploadMode = result.upload_mode === "r2" ? "r2" : "local";
+        fileHelp.textContent = uploadMode === "r2"
+            ? "MP4 or WebM · up to 20 GB · resumable upload"
+            : "MP4 or WebM · up to 150 MB";
         videos = result.videos;
         renderVideos();
     } catch (error) {
@@ -381,6 +430,120 @@ function isSupportedFile(file, allowedTypes, extensions) {
     return allowedTypes.includes(file.type) || extensions.some((extension) => file.name.toLowerCase().endsWith(extension));
 }
 
+function getVideoMimeType(file) {
+    if (["video/mp4", "video/webm"].includes(file.type)) return file.type;
+    return file.name.toLowerCase().endsWith(".webm") ? "video/webm" : "video/mp4";
+}
+
+function getCoverMimeType(file) {
+    if (["image/jpeg", "image/png", "image/webp"].includes(file.type)) return file.type;
+    const extension = file.name.toLowerCase().split(".").pop();
+    return extension === "png" ? "image/png" : extension === "webp" ? "image/webp" : "image/jpeg";
+}
+
+function setUploadProgress(bytesUploaded, totalBytes) {
+    const percent = Math.min(100, Math.round((bytesUploaded / totalBytes) * 100));
+    progressBar.style.width = `${percent}%`;
+    progressLabel.textContent = percent >= 100
+        ? "Saving your video…"
+        : `Uploading to video storage… ${percent}%`;
+}
+
+async function uploadVideoToR2(file, customCover, generatedCover) {
+    const cover = customCover || generatedCover;
+    const coverMimeType = cover
+        ? (customCover ? getCoverMimeType(customCover) : "image/jpeg")
+        : null;
+    const upload = await postApiJson("upload-init", {
+        title: document.querySelector("#video-title").value,
+        creator: document.querySelector("#video-creator").value,
+        description: document.querySelector("#video-description").value,
+        file_name: file.name,
+        video_mime_type: getVideoMimeType(file),
+        video_size: file.size,
+        cover_mime_type: coverMimeType,
+        cover_size: cover ? cover.size : 0,
+    });
+
+    try {
+        saveDeleteToken(upload.video_id, upload.upload_token);
+        if (cover && upload.cover_upload_url) {
+            progressLabel.textContent = "Uploading your cover…";
+            await uploadBlobWithProgress(upload.cover_upload_url, cover, coverMimeType, () => {});
+        }
+
+        const partCount = Math.ceil(file.size / R2_PART_SIZE);
+        const parts = new Array(partCount);
+        const activeProgress = new Map();
+        let nextPart = 1;
+        let completedBytes = 0;
+
+        async function uploadWorker() {
+            while (true) {
+                const partNumber = nextPart++;
+                if (partNumber > partCount) return;
+
+                const start = (partNumber - 1) * R2_PART_SIZE;
+                const chunk = file.slice(start, Math.min(start + R2_PART_SIZE, file.size));
+                let etag = "";
+                let lastError;
+
+                for (let attempt = 1; attempt <= 3; attempt++) {
+                    try {
+                        const signedPart = await postApiJson("upload-part", {
+                            video_id: upload.video_id,
+                            upload_token: upload.upload_token,
+                            part_number: partNumber,
+                        });
+                        etag = await uploadBlobWithProgress(
+                            signedPart.url,
+                            chunk,
+                            "application/octet-stream",
+                            (loaded) => {
+                                activeProgress.set(partNumber, loaded);
+                                const activeBytes = [...activeProgress.values()].reduce((sum, value) => sum + value, 0);
+                                setUploadProgress(completedBytes + activeBytes, file.size);
+                            }
+                        );
+                        break;
+                    } catch (error) {
+                        lastError = error;
+                        if (attempt < 3) {
+                            await new Promise((resolve) => window.setTimeout(resolve, attempt * 700));
+                        }
+                    }
+                }
+
+                if (!etag) throw lastError || new Error("A video upload part failed.");
+                activeProgress.delete(partNumber);
+                completedBytes += chunk.size;
+                parts[partNumber - 1] = { part_number: partNumber, etag };
+                setUploadProgress(completedBytes, file.size);
+            }
+        }
+
+        progressLabel.textContent = "Preparing resumable video upload…";
+        const workerCount = Math.min(R2_UPLOAD_CONCURRENCY, partCount);
+        await Promise.all(Array.from({ length: workerCount }, () => uploadWorker()));
+        progressLabel.textContent = "Finishing your video…";
+        await postApiJson("upload-complete", {
+            video_id: upload.video_id,
+            upload_token: upload.upload_token,
+            parts,
+        });
+    } catch (error) {
+        try {
+            await postApiJson("upload-abort", {
+                video_id: upload.video_id,
+                upload_token: upload.upload_token,
+            });
+        } catch (abortError) {
+            throw new Error(`${error.message} The unfinished storage upload could not be cleaned up: ${abortError.message}`);
+        }
+        throw error;
+    }
+}
+
 fileInput.addEventListener("change", () => {
     const file = fileInput.files[0];
     fileName.textContent = file ? file.name : "";
@@ -426,8 +589,11 @@ uploadForm.addEventListener("submit", async (event) => {
         uploadMessage.textContent = "Choose a video to share first.";
         return;
     }
-    if (file.size > MAX_FILE_SIZE) {
-        uploadMessage.textContent = "That video is a little too big. Please choose one under 150 MB.";
+    const maximumFileSize = uploadMode === "r2" ? MAX_R2_FILE_SIZE : MAX_LOCAL_FILE_SIZE;
+    if (file.size > maximumFileSize) {
+        uploadMessage.textContent = uploadMode === "r2"
+            ? "That video is too big. Please choose one under 20 GB."
+            : "That video is a little too big. Please choose one under 150 MB.";
         return;
     }
     if (!isSupportedFile(file, ["video/mp4", "video/webm"], [".mp4", ".webm"])) {
@@ -455,21 +621,40 @@ uploadForm.addEventListener("submit", async (event) => {
     progressBar.style.width = "0%";
     progressLabel.textContent = customCover ? "Getting your video ready…" : "Picking a cover frame…";
 
-    const formData = new FormData(uploadForm);
-    let generatedCoverFailed = false;
+    let generatedCover = null;
     try {
         if (!customCover) {
-            const thumbnail = await createVideoThumbnail(file);
-            if (thumbnail) {
-                formData.append("thumbnail", thumbnail, "video-cover.jpg");
-            } else {
-                generatedCoverFailed = true;
-            }
+            generatedCover = await createVideoThumbnail(file);
         }
     } catch {
-        generatedCoverFailed = true;
+        generatedCover = null;
     }
 
+    if (uploadMode === "r2") {
+        try {
+            await uploadVideoToR2(file, customCover, generatedCover);
+            uploadMessage.textContent = generatedCover === null && !customCover
+                ? "Your video is on the memory lane. We used a cozy placeholder cover."
+                : "Your video is on the memory lane. Thanks for sharing!";
+            uploadMessage.classList.add("success");
+            uploadForm.reset();
+            fileName.textContent = "";
+            coverName.textContent = "Choose a cover photo";
+            await loadVideos();
+            document.querySelector("#videos").scrollIntoView({ behavior: "smooth" });
+        } catch (error) {
+            uploadMessage.textContent = error.message || "Couldn't upload your video. Please try again.";
+        } finally {
+            submitButton.disabled = false;
+            uploadProgress.hidden = true;
+        }
+        return;
+    }
+
+    const formData = new FormData(uploadForm);
+    if (!customCover && generatedCover) {
+        formData.append("thumbnail", generatedCover, "video-cover.jpg");
+    }
     const request = new XMLHttpRequest();
     request.open("POST", `${API_URL}?action=upload`);
     request.setRequestHeader("Accept", "application/json");
@@ -498,7 +683,7 @@ uploadForm.addEventListener("submit", async (event) => {
         if (result && request.status >= 200 && request.status < 300 && result.success) {
             try {
                 saveDeleteToken(result.id, result.delete_token);
-                uploadMessage.textContent = generatedCoverFailed
+                uploadMessage.textContent = generatedCover === null && !customCover
                     ? "Your video is on the memory lane. We used a cozy placeholder cover."
                     : "Your video is on the memory lane. Thanks for sharing!";
                 uploadMessage.classList.add("success");
