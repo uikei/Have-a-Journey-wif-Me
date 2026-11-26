@@ -1,4 +1,5 @@
-const API_URL = "backend/api.php";
+const apiUrlMeta = document.querySelector('meta[name="journey-api-url"]');
+const API_URL = apiUrlMeta?.content.trim() || "backend/api.php";
 const MAX_FILE_SIZE = 150 * 1024 * 1024;
 const MAX_COVER_SIZE = 5 * 1024 * 1024;
 const DELETE_TOKEN_STORAGE_KEY = "have-a-journey-video-delete-keys";
@@ -38,6 +39,23 @@ function showVideoMessage(message, className) {
 function showStorageWarning(message) {
     storageWarning.textContent = message;
     storageWarning.hidden = false;
+}
+
+function backendUnavailableMessage() {
+    return "The video backend isn't available here. GitHub Pages can't run PHP. Host the PHP API and MySQL database on a PHP-capable server to enable the gallery and uploads.";
+}
+
+async function readApiResponse(response) {
+    const contentType = response.headers.get("content-type") || "";
+    if (!contentType.toLowerCase().includes("application/json")) {
+        throw new Error(backendUnavailableMessage());
+    }
+
+    try {
+        return await response.json();
+    } catch {
+        throw new Error("The video server returned an invalid response. Please try again later.");
+    }
 }
 
 function readDeleteTokens() {
@@ -241,7 +259,7 @@ async function loadVideos() {
     showVideoMessage("Gathering the good memories...", "loading-message");
     try {
         const response = await fetch(`${API_URL}?action=list`, { headers: { Accept: "application/json" } });
-        const result = await response.json();
+        const result = await readApiResponse(response);
         if (!response.ok || !result.success || !Array.isArray(result.videos)) {
             throw new Error(result.error || "Couldn't load the videos right now.");
         }
@@ -303,7 +321,7 @@ async function deleteVideo(video, token, button) {
 
     try {
         const response = await fetch(`${API_URL}?action=delete`, { method: "POST", body: formData });
-        const result = await response.json();
+        const result = await readApiResponse(response);
         if (!response.ok || !result.success) {
             throw new Error(result.error || "This video couldn't be removed.");
         }
@@ -466,10 +484,15 @@ uploadForm.addEventListener("submit", async (event) => {
 
     request.addEventListener("load", async () => {
         let result;
-        try {
-            result = JSON.parse(request.responseText);
-        } catch {
-            uploadMessage.textContent = "The server returned an unexpected response. Please try again.";
+        const responseType = request.getResponseHeader("Content-Type") || "";
+        if (!responseType.toLowerCase().includes("application/json")) {
+            uploadMessage.textContent = backendUnavailableMessage();
+        } else {
+            try {
+                result = JSON.parse(request.responseText);
+            } catch {
+                uploadMessage.textContent = "The video server returned an invalid response. Please try again later.";
+            }
         }
 
         if (result && request.status >= 200 && request.status < 300 && result.success) {

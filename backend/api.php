@@ -16,8 +16,27 @@ const ALLOWED_COVER_TYPES = [
 header('X-Content-Type-Options: nosniff');
 header('Referrer-Policy: no-referrer');
 
-$action = $_GET['action'] ?? '';
+$allowed_origin = getenv('JOURNEY_ALLOWED_ORIGIN') ?: '';
+$request_origin = $_SERVER['HTTP_ORIGIN'] ?? '';
+$origin_is_allowed = $allowed_origin !== '' && $request_origin !== '' && hash_equals($allowed_origin, $request_origin);
+if ($origin_is_allowed) {
+    header('Access-Control-Allow-Origin: ' . $allowed_origin);
+    header('Access-Control-Allow-Methods: GET, POST, OPTIONS');
+    header('Access-Control-Allow-Headers: Accept, Content-Type');
+    header('Access-Control-Expose-Headers: Accept-Ranges, Content-Range');
+    header('Vary: Origin');
+}
+
 $method = $_SERVER['REQUEST_METHOD'] ?? 'GET';
+if ($method === 'OPTIONS') {
+    if (!$origin_is_allowed) {
+        send_json(['success' => false, 'error' => 'This website is not allowed to use the video API.'], 403);
+    }
+    http_response_code(204);
+    exit;
+}
+
+$action = $_GET['action'] ?? '';
 
 try {
     if ($action === 'list' && $method === 'GET') {
